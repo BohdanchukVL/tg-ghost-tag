@@ -1,5 +1,4 @@
-/* @tg-ghost-tag/core — minimal TS library for Telegram invisible mentions
-   Requires Node 18+ (global fetch). */
+/* @tg-ghost-tag/core — TS lib for Telegram invisible mentions (Node 18+) */
 
 export type UserId = number;
 export type ChatId = number | string;
@@ -7,19 +6,35 @@ export type ChatId = number | string;
 export interface MessageEntityTextMention {
   type: "text_mention";
   offset: number; // UTF-16 code units
-  length: number; // always 1 (for INV char)
+  length: number; // 1 (INV char)
   user: { id: UserId };
 }
 export type MessageEntity = MessageEntityTextMention;
 
 export interface GhostTemplate {
+  // classic mode
   before?: string;
   after?: string;
-  char?: string; // INV character (fallback)
+  char?: string; // INV fallback
+
+  // smart mode
   message?: string;
+
+  // INV picking
   charCandidates?: string[];
+
+  // smart placement
+  replaceTargets?: string[]; // example: ['.', '!']
+  replacePosition?: "start" | "end" | number; // number → insert after this index (UTF-16)
+  fallbackPosition?: "start" | "end"; // where to insert if anchor not found
+
+  // legacy heuristic (if replaceTargets/replacePosition:number not specified)
   punctuationRegex?: RegExp;
   preferEndIfNoPunctuation?: boolean;
+
+  // formatting
+  separateLineForMentions?: boolean; // true → add '\n' before INV
+  trailingNewline?: boolean; // true → add '\n' after INV
 }
 
 export interface GhostPayload {
@@ -30,6 +45,8 @@ export interface GhostPayload {
 
 export interface BuildOptions {
   maxPerMessage?: number; // default 5
+  maxTextLength?: number; // default 4096
+  onOverflow?: "split" | "error"; // default 'split': split; 'error': throw error
 }
 
 const DEFAULT_INV_CANDIDATES = [
@@ -40,6 +57,7 @@ const DEFAULT_INV_CANDIDATES = [
   "\u200D"
 ];
 const DEFAULT_PUNCT_RE = /[.!?…]/;
+const DEFAULT_MAX_TEXT = 4096;
 
 const toNFC = (s: string) => (s as any).normalize?.("NFC") ?? s;
 
@@ -55,17 +73,17 @@ function pickInvChar(
   ...avoidIn: Array<string | undefined>
 ): string {
   for (const c of candidates) {
+    if (c.length !== 1) continue; // гарантуємо 1 code unit
     if (!avoidIn.some((s) => s?.includes?.(c))) return c;
   }
-  return candidates[0];
+  return candidates[0] ?? "\u200B";
 }
 
-/** Build text and offsets for N mentions: before + INV.repeat(N) + after */
+/** classic: before + INV.repeat(N) + after */
 export function buildInvisibleText(
   count: number,
   template: GhostTemplate = {}
 ): { text: string; offsets: number[]; invChar: string } {
-  // OLD path (explicit before/after)
   const charList = template.charCandidates ?? DEFAULT_INV_CANDIDATES;
   const inv =
     template.char ?? pickInvChar(charList, template.before, template.after);
@@ -78,14 +96,12 @@ export function buildInvisibleText(
   if (count <= 0)
     return { text: `${before}${after}`, offsets: [], invChar: inv };
 
-  // JS string .length is already in UTF-16 code units, which Bot API expects
-  const prefixLen = before.length;
+  const prefixLen = before.length; // UTF-16 units (Bot API format)
   const text = `${before}${inv.repeat(count)}${after}`;
   const offsets = Array.from({ length: count }, (_, i) => prefixLen + i);
   return { text, offsets, invChar: inv };
 }
 
-/** Build MessageEntity[] from offsets and userIds */
 export function buildEntities(
   offsets: number[],
   userIds: UserId[]
@@ -103,88 +119,235 @@ export function buildEntities(
   }));
 }
 
-/** Split userIds into chunks of size maxPerMessage */
-export function chunkUserIds(userIds: UserId[], maxPerMessage = 5): UserId[][] {
+export function chunkUserIds(
+  userIds: UserId[],
+  maxPerMessage = 100
+): UserId[][] {
   const out: UserId[][] = [];
-  for (let i = 0; i < userIds.length; i += maxPerMessage) {
+  for (let i = 0; i < userIds.length; i += maxPerMessage)
     out.push(userIds.slice(i, i + maxPerMessage));
-  }
   return out;
 }
 
-function insertInvIntoMessage(
-  message: string,
-  count: number,
-  inv: string,
-  punctuationRe: RegExp,
-  preferEndIfNoPunct: boolean
-): { text: string; offsets: number[] } {
-  const src = toNFC(message);
-  if (count <= 0) return { text: src, offsets: [] };
-
-  let last = -1;
-  for (let i = 0; i < src.length; i++) {
-    const ch = src[i];
-    if (punctuationRe.test(ch)) last = i;
-  }
-  const insertAt =
-    last >= 0 ? last + 1 : preferEndIfNoPunct ? src.length : src.length;
-  const left = src.slice(0, insertAt);
-  const right = src.slice(insertAt);
-
-  const text = `${left}${inv.repeat(count)}${right}`;
-  const base = insertAt;
-  const offsets = Array.from({ length: count }, (_, i) => base + i);
-  return { text, offsets };
+function clamp(v: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, v));
 }
 
-/** Create payloads for sendMessage (without sending) */
+function findAnchorIndex(
+  src: string,
+  opts: {
+    replaceTargets?: string[];
+    replacePosition?: "start" | "end" | number;
+    punctuationRegex?: RegExp;
+    fallbackPosition: "start" | "end";
+  }
+): number {
+  if (
+    typeof opts.replacePosition === "number" &&
+    Number.isFinite(opts.replacePosition)
+  ) {
+    return clamp(Math.trunc(opts.replacePosition) + 1, 0, src.length);
+  }
+
+  if (opts.replaceTargets && opts.replaceTargets.length) {
+    const set = new Set(opts.replaceTargets);
+    for (let i = src.length - 1; i >= 0; i--) {
+      if (set.has(src[i])) return opts.replacePosition === "start" ? i : i + 1;
+    }
+  }
+
+  if (opts.punctuationRegex) {
+    const r = new RegExp(
+      opts.punctuationRegex.source,
+      opts.punctuationRegex.flags.replace(/g/g, "")
+    );
+    for (let i = src.length - 1; i >= 0; i--) {
+      if (r.test(src[i])) return opts.replacePosition === "start" ? i : i + 1;
+    }
+  }
+
+  return opts.fallbackPosition === "start" ? 0 : src.length;
+}
+
+function buildSmartBaseText(
+  message: string,
+  inv: string,
+  count: number,
+  anchorAt: number,
+  separateLine: boolean,
+  trailingNewline: boolean
+): {
+  text: string;
+  baseLen: number;
+  insertAt: number;
+  newlineOverhead: number;
+} {
+  const src = toNFC(message);
+  const left = src.slice(0, anchorAt);
+  const right = src.slice(anchorAt);
+  const nlBefore = separateLine ? "\n" : "";
+  const nlAfter = trailingNewline ? "\n" : "";
+  const text = `${left}${nlBefore}${inv.repeat(count)}${nlAfter}${right}`;
+  const baseLen = left.length + nlBefore.length + nlAfter.length + right.length;
+  const insertAt = left.length + nlBefore.length; // позиція першого INV
+  const newlineOverhead = nlBefore.length + nlAfter.length;
+  return { text, baseLen, insertAt, newlineOverhead };
+}
+
+function capCountByLength(
+  baseLen: number,
+  desiredCount: number,
+  maxTextLength: number
+): number {
+  const allowed = Math.max(0, maxTextLength - baseLen);
+  return Math.max(0, Math.min(desiredCount, allowed));
+}
+
+/** Build payloads for sendMessage (without sending) */
 export function buildGhostPayloads(
   chatId: ChatId,
   userIds: UserId[],
   template: GhostTemplate = {},
   opts: BuildOptions = {}
 ): GhostPayload[] {
-  const { maxPerMessage = 5 } = opts;
-  const chunks = chunkUserIds(userIds, maxPerMessage);
+  const maxPerMessage = Math.max(1, opts.maxPerMessage ?? 100);
+  const maxTextLength = opts.maxTextLength ?? DEFAULT_MAX_TEXT;
+  const onOverflow: "split" | "error" = opts.onOverflow ?? "split";
 
-  const useSmart =
+  if (!Array.isArray(userIds) || userIds.length === 0) return [];
+
+  const smartMode =
     template.message &&
     template.before === undefined &&
     template.after === undefined;
+  const payloads: GhostPayload[] = [];
 
-  if (useSmart) {
+  if (smartMode) {
     const msg = template.message!;
-    const punctRe = template.punctuationRegex ?? DEFAULT_PUNCT_RE;
-    const inv = pickInvChar(
-      template.charCandidates ?? DEFAULT_INV_CANDIDATES,
-      msg
-    );
+    const inv =
+      template.char ??
+      pickInvChar(template.charCandidates ?? DEFAULT_INV_CANDIDATES, msg);
+    const fallbackPosition =
+      template.fallbackPosition ??
+      (template.preferEndIfNoPunctuation ?? true ? "end" : "start");
+    const punctuationRegex = template.punctuationRegex ?? DEFAULT_PUNCT_RE;
+    const separateLine = !!template.separateLineForMentions;
+    const trailingNewline = !!template.trailingNewline;
 
-    return chunks.map((chunk) => {
-      const { text, offsets } = insertInvIntoMessage(
+    let cursor = 0;
+    while (cursor < userIds.length) {
+      let desired = Math.min(maxPerMessage, userIds.length - cursor);
+
+      const anchorAt = findAnchorIndex(msg, {
+        replaceTargets: template.replaceTargets,
+        replacePosition: template.replacePosition ?? "end",
+        punctuationRegex,
+        fallbackPosition
+      });
+
+      const { baseLen } = buildSmartBaseText(
         msg,
-        chunk.length,
         inv,
-        punctRe,
-        template.preferEndIfNoPunctuation ?? true
+        0,
+        anchorAt,
+        separateLine,
+        trailingNewline
       );
-      const entities = buildEntities(offsets, chunk);
-      return { chat_id: chatId, text, entities };
-    });
+      const allowed = capCountByLength(baseLen, desired, maxTextLength);
+
+      if (allowed === 0) {
+        throw new Error(
+          `Base message too long to insert mentions (length=${msg.length}).`
+        );
+      }
+      if (onOverflow === "error" && allowed < desired) {
+        throw new Error(
+          `Text overflow: need ${desired} mentions but only ${allowed} fit under ${maxTextLength}.`
+        );
+      }
+
+      const take = allowed;
+      const batch = userIds.slice(cursor, cursor + take);
+      const { text, insertAt } = buildSmartBaseText(
+        msg,
+        inv,
+        batch.length,
+        anchorAt,
+        separateLine,
+        trailingNewline
+      );
+      if (text.length > maxTextLength) {
+        throw new Error(
+          `Resulting text exceeds ${maxTextLength} chars (smart mode).`
+        );
+      }
+      const offsets = Array.from(
+        { length: batch.length },
+        (_, i) => insertAt + i
+      );
+      const entities = buildEntities(offsets, batch);
+      payloads.push({ chat_id: chatId, text, entities });
+
+      cursor += take;
+    }
+    return payloads;
   }
 
-  return chunks.map((chunk) => {
-    const { text, offsets } = buildInvisibleText(chunk.length, template);
-    const entities = buildEntities(offsets, chunk);
-    return { chat_id: chatId, text, entities };
-  });
+  // classic mode (before/after)
+  const chunks = chunkUserIds(userIds, maxPerMessage);
+  const charList = template.charCandidates ?? DEFAULT_INV_CANDIDATES;
+  const inv =
+    template.char ?? pickInvChar(charList, template.before, template.after);
+  const before = toNFC(template.before ?? "");
+  const after = toNFC(template.after ?? "");
+  assertNoExistingInv(before, inv);
+  assertNoExistingInv(after, inv);
+
+  const baseLen = before.length + after.length;
+  const capacity = Math.max(0, maxTextLength - baseLen);
+  if (capacity <= 0) {
+    throw new Error(
+      `Classic mode: base too long (before+after=${baseLen}) to insert any mentions under ${maxTextLength}.`
+    );
+  }
+
+  for (const chunk of chunks) {
+    if (onOverflow === "error" && chunk.length > capacity) {
+      throw new Error(
+        `Classic mode overflow: need ${chunk.length} mentions, capacity ${capacity} at ${maxTextLength}.`
+      );
+    }
+    let remaining = chunk.slice();
+    while (remaining.length > 0) {
+      const take = Math.min(remaining.length, capacity);
+      const part = remaining.slice(0, take);
+      const { text, offsets } = buildInvisibleText(part.length, {
+        ...template,
+        char: inv
+      });
+      if (text.length > maxTextLength) {
+        throw new Error(
+          `Classic mode: resulting text exceeds ${maxTextLength} chars.`
+        );
+      }
+      const entities = buildEntities(offsets, part);
+      payloads.push({ chat_id: chatId, text, entities });
+      remaining = remaining.slice(take);
+      if (onOverflow === "error" && remaining.length > 0) {
+        throw new Error(
+          `Classic mode overflow while splitting: leftover ${remaining.length}.`
+        );
+      }
+    }
+  }
+
+  return payloads;
 }
 
 // --- Optional: send via Bot API ---
 export interface SendOptions extends BuildOptions {
   token: string; // Bot token
-  delayBetween?: number; // ms between sendMessage calls (default 0)
+  delayBetween?: number; // ms
   fetchImpl?: typeof fetch;
 }
 
@@ -202,9 +365,7 @@ async function callBotApi<T>(
 ): Promise<T> {
   const f = fetchImpl ?? (globalThis as any).fetch;
   if (!f)
-    throw new Error(
-      "No fetch implementation available in this runtime (Node 18+ required)"
-    );
+    throw new Error("No fetch implementation available (Node 18+ required)");
   const res = await f(`https://api.telegram.org/bot${token}/${method}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -218,25 +379,47 @@ async function callBotApi<T>(
   return json.result as T;
 }
 
-/** Send one or more payloads to Telegram */
 export async function sendGhostMentions(
   chatId: ChatId,
   userIds: UserId[],
   template: GhostTemplate,
   options: SendOptions
 ): Promise<SendResult> {
-  const { token, maxPerMessage = 5, delayBetween = 0, fetchImpl } = options;
+  const {
+    token,
+    maxPerMessage = 5,
+    delayBetween = 0,
+    fetchImpl,
+    maxTextLength = DEFAULT_MAX_TEXT,
+    onOverflow = "split"
+  } = options;
+
   const payloads = buildGhostPayloads(chatId, userIds, template, {
-    maxPerMessage
+    maxPerMessage,
+    maxTextLength,
+    onOverflow
   });
+
+  // safety check
+  for (const p of payloads) {
+    if (p.text.length > maxTextLength) {
+      throw new Error(
+        `Payload text exceeds ${maxTextLength} chars; chat_id=${p.chat_id}`
+      );
+    }
+  }
 
   const messageIds: number[] = [];
   const errors: { index: number; error: unknown }[] = [];
 
   for (let i = 0; i < payloads.length; i++) {
-    const p = payloads[i];
     try {
-      const result = await callBotApi<any>(token, "sendMessage", p, fetchImpl);
+      const result = await callBotApi<any>(
+        token,
+        "sendMessage",
+        payloads[i],
+        fetchImpl
+      );
       messageIds.push(result.message_id);
     } catch (err) {
       errors.push({ index: i, error: err });
@@ -266,13 +449,12 @@ export async function editCascade(
   { token, delayMs = 1000, fetchImpl }: EditCascadeOptions
 ): Promise<number> {
   if (userIds.length === 0) throw new Error("No userIds provided");
-  // initial send
   const first = buildGhostPayloads(chatId, [userIds[0]], template, {
     maxPerMessage: 1
   })[0];
   const initial = await callBotApi<any>(token, "sendMessage", first, fetchImpl);
   const messageId = initial.message_id as number;
-  // sequential edits
+
   for (let i = 1; i < userIds.length; i++) {
     const batched = buildGhostPayloads(chatId, [userIds[i]], template, {
       maxPerMessage: 1
@@ -289,7 +471,7 @@ export async function editCascade(
   return messageId;
 }
 
-// quick self-check (no side effects)
+/* self-check */
 (function _selfTest() {
   const { text, offsets } = buildInvisibleText(3, { before: "A", after: "B" });
   if (
@@ -299,6 +481,6 @@ export async function editCascade(
       offsets[2] === 3
     )
   ) {
-    console.warn("tg-ghost self-test failed (offsets) — check environment");
+    console.warn("tg-ghost self-test failed (offsets)");
   }
 })();
