@@ -1,6 +1,6 @@
 {
   "name": "tg-ghost-tag",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Invisible mentions for Telegram bots using zero-width characters",
   "keywords": [
     "telegram",
