@@ -26,3 +26,6 @@ coverage/
 *.tgz
 .npmrc
 
+# Force include lock file (overrides global gitignore)
+!package-lock.json
+
